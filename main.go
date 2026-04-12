@@ -91,6 +91,15 @@ func handlerRegister(s *state, cmd command) error {
 	return nil
 }
 
+func handlerReset(s *state, cmd command) error {
+	err := s.db.DeleteUsers(context.Background())
+	if err != nil {
+		return fmt.Errorf("error resetting users table: %w", err)
+	}
+	fmt.Println("Users table reset successfully")
+	return nil
+}
+
 func main() {
 	cfg, err := config.Read()
 	if err != nil {
@@ -115,6 +124,7 @@ func main() {
 
 	cmds.register("login", handlerLogin)
 	cmds.register("register", handlerRegister)
+	cmds.register("reset", handlerReset)
 
 	args := os.Args
 	if len(args) < 2 {
