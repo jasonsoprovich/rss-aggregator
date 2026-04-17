@@ -94,6 +94,60 @@ func handlerFeeds(s *state, cmd command) error {
 	return nil
 }
 
+func handlerFollow(s *state, cmd command) error {
+	if len(cmd.args) != 1 {
+		return errors.New("follow requires a url argument")
+	}
+
+	url := cmd.args[0]
+
+	currentUser, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	if err != nil {
+		return fmt.Errorf("getting current user: %w", err)
+	}
+
+	feed, err := s.db.GetFeedByURL(context.Background(), url)
+	if err != nil {
+		return fmt.Errorf("getting feed by url: %w", err)
+	}
+
+	follow, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    currentUser.ID,
+		FeedID:    feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("creating feed follow: %w", err)
+	}
+
+	fmt.Printf("%s is now following %s\n", follow.UserName, follow.FeedName)
+	return nil
+}
+
+func handlerFollowing(s *state, cmd command) error {
+	if len(cmd.args) != 0 {
+		return errors.New("following takes no arguments")
+	}
+
+	currentUser, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	if err != nil {
+		return fmt.Errorf("getting current user: %w", err)
+	}
+
+	follows, err := s.db.GetFeedFollowsForUser(context.Background(), currentUser.ID)
+	if err != nil {
+		return fmt.Errorf("getting feed follows: %w", err)
+	}
+
+	for _, follow := range follows {
+		fmt.Println(follow.FeedName)
+	}
+
+	return nil
+}
+
 func handlerLogin(s *state, cmd command) error {
 	if len(cmd.args) == 0 {
 		return errors.New("login requires a username argument")
@@ -244,7 +298,19 @@ func handlerAddFeed(s *state, cmd command) error {
 		return fmt.Errorf("creating feed: %w", err)
 	}
 
-	fmt.Printf("Feed created:\n%+v\n", feed)
+	follow, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    currentUser.ID,
+		FeedID:    feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("creating feed follow: %w", err)
+	}
+
+	fmt.Printf("Feed created: %s\n", feed.Name)
+	fmt.Printf("%s is now following %s\n", follow.UserName, follow.FeedName)
 	return nil
 }
 
@@ -277,6 +343,8 @@ func main() {
 	cmds.register("agg", handlerAgg)
 	cmds.register("addfeed", handlerAddFeed)
 	cmds.register("feeds", handlerFeeds)
+	cmds.register("follow", handlerFollow)
+	cmds.register("following", handlerFollowing)
 
 	args := os.Args
 	if len(args) < 2 {
