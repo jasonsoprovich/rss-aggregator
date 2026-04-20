@@ -11,12 +11,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jasonsoprovich/rss-aggregator/internal/config"
 	"github.com/jasonsoprovich/rss-aggregator/internal/database"
 
+	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
 
@@ -60,6 +62,11 @@ type Feed struct {
 	Name      string
 	URL       string
 	UserID    uuid.UUID
+}
+
+func isDuplicatePostError(err error) bool {
+	pqErr, ok := err.(*pq.Error)
+	return ok && string(pqErr.Code) == "23505"
 }
 
 func (c *commands) register(name string, f func(*state, command) error) {
@@ -290,14 +297,74 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	return &feed, nil
 }
 
+func parsePublishedAt(value string) (sql.NullTime, error) {
+	if value == "" {
+		return sql.NullTime{Valid: false}, nil
+	}
+	formats := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		time.RFC3339,
+		time.RFC822,
+		time.RFC822Z,
+	}
+	for _, format := range formats {
+		t, err := time.Parse(format, value)
+		if err == nil {
+			return sql.NullTime{
+				Time:  t,
+				Valid: true,
+			}, nil
+		}
+	}
+
+	return sql.NullTime{}, fmt.Errorf("unknown time format: %s", value)
+}
+
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := int32(2)
+
+	if len(cmd.args) > 1 {
+		return errors.New("browse accepts at most one optional limit argument")
+	}
+
+	if len(cmd.args) == 1 {
+		n, err := strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("invalid limit: %w", err)
+		}
+		limit = int32(n)
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  limit,
+	})
+	if err != nil {
+		return fmt.Errorf("getting posts for user: %w", err)
+	}
+
+	for _, post := range posts {
+		fmt.Printf("Title: %s\n", post.Title)
+		fmt.Printf("URL: %s\n", post.Url)
+		if post.Description.Valid {
+			fmt.Printf("Description: %s\n", post.Description.String)
+		}
+		if post.PublishedAt.Valid {
+			fmt.Printf("Published At: %s\n", post.PublishedAt.Time.Format(time.RFC3339))
+		}
+		fmt.Println("---")
+	}
+	return nil
+}
+
 func scrapeFeeds(s *state) error {
 	feed, err := s.db.GetNextFeedToFetch(context.Background())
 	if err != nil {
 		return fmt.Errorf("getting next feed to fetch: %w", err)
 	}
 
-	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
-	if err != nil {
+	if err := s.db.MarkFeedFetched(context.Background(), feed.ID); err != nil {
 		return fmt.Errorf("marking feed fetched: %w", err)
 	}
 
@@ -306,11 +373,30 @@ func scrapeFeeds(s *state) error {
 		return fmt.Errorf("fetching feed: %w", err)
 	}
 
-	fmt.Printf("Fetched feed: %s\n", feed.Name)
 	for _, item := range rssFeed.Channel.Item {
-		fmt.Printf("- %s\n", item.Title)
-	}
+		publishedAt, err := parsePublishedAt(item.PubDate)
+		if err != nil {
+			log.Printf("could not parse published dat %q: %v", item.PubDate, err)
+		}
 
+		_, err = s.db.CreatePost(context.Background(), database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+			PublishedAt: publishedAt,
+			FeedID:      feed.ID,
+		})
+
+		if err != nil {
+			if isDuplicatePostError(err) {
+				continue
+			}
+			log.Printf("creating post for %s: %v", item.Link, err)
+		}
+	}
 	return nil
 }
 
@@ -403,6 +489,7 @@ func main() {
 	cmds.register("follow", middlewareLoggedIn(handlerFollow))
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
 	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
 
 	args := os.Args
 	if len(args) < 2 {
