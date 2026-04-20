@@ -3,22 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/xml"
-	"errors"
-	"fmt"
-	"html"
-	"io"
 	"log"
-	"net/http"
 	"os"
-	"strconv"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/jasonsoprovich/rss-aggregator/internal/config"
 	"github.com/jasonsoprovich/rss-aggregator/internal/database"
 
-	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
 
@@ -27,226 +17,54 @@ type state struct {
 	cfg *config.Config
 }
 
-type command struct {
-	name string
-	args []string
-}
-
-type commands struct {
-	handlers map[string]func(*state, command) error
-}
-
-type RSSFeed struct {
-	Channel RSSChannel `xml:"channel"`
-}
-
-type RSSChannel struct {
-	Title       string    `xml:"title"`
-	Description string    `xml:"description"`
-	Link        string    `xml:"link"`
-	Item        []RSSItem `xml:"item"`
-}
-
-type RSSItem struct {
-	Title       string `xml:"title"`
-	Description string `xml:"description"`
-	Link        string `xml:"link"`
-	GUID        string `xml:"guid"`
-	PubDate     string `xml:"pubDate"`
-}
-
-type Feed struct {
-	ID        uuid.UUID
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	Name      string
-	URL       string
-	UserID    uuid.UUID
-}
-
-func isDuplicatePostError(err error) bool {
-	pqErr, ok := err.(*pq.Error)
-	return ok && string(pqErr.Code) == "23505"
-}
-
-func (c *commands) register(name string, f func(*state, command) error) {
-	c.handlers[name] = f
-}
-
-func (c *commands) run(s *state, cmd command) error {
-	handler, ok := c.handlers[cmd.name]
-	if !ok {
-		return fmt.Errorf("unknown command: %s", cmd.name)
-	}
-	return handler(s, cmd)
-}
-
-func handlerFeeds(s *state, cmd command) error {
-	if len(cmd.args) != 0 {
-		return errors.New("feeds command takes no arguments")
-	}
-
-	feeds, err := s.db.GetFeeds(context.Background())
+func main() {
+	cfg, err := config.Read()
 	if err != nil {
-		return fmt.Errorf("getting feeds: %w", err)
+		log.Fatalf("error reading config: %v", err)
 	}
 
-	for _, feed := range feeds {
-		fmt.Printf("Name: %s\n", feed.Name)
-		fmt.Printf("URL: %s\n", feed.Url)
-		fmt.Printf("User: %s\n", feed.UserName)
-		fmt.Println("---")
+	db, err := sql.Open("postgres", cfg.DBURL)
+	if err != nil {
+		log.Fatalf("error connecting to db: %v", err)
+	}
+	defer db.Close()
+	dbQueries := database.New(db)
+
+	programState := &state{
+		db:  dbQueries,
+		cfg: &cfg,
 	}
 
-	return nil
+	cmds := commands{
+		registeredCommands: make(map[string]func(*state, command) error),
+	}
+
+	cmds.register("register", handlerRegister)
+	cmds.register("login", handlerLogin)
+	cmds.register("reset", handlerReset)
+	cmds.register("users", handlerListUsers)
+	cmds.register("agg", handlerAgg)
+	cmds.register("addfeed", middlewareLoggedIn(handlerAddFeed))
+	cmds.register("feeds", handlerListFeeds)
+	cmds.register("follow", middlewareLoggedIn(handlerFollow))
+	cmds.register("following", middlewareLoggedIn(handlerListFeedFollows))
+	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
+
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: cli <command> [args...]")
+	}
+
+	cmdName := os.Args[1]
+	cmdArgs := os.Args[2:]
+
+	err = cmds.run(programState, command{Name: cmdName, Args: cmdArgs})
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
-func handlerFollow(s *state, cmd command, user database.User) error {
-	if len(cmd.args) != 1 {
-		return errors.New("follow requires a url argument")
-	}
-
-	url := cmd.args[0]
-
-	feed, err := s.db.GetFeedByURL(context.Background(), url)
-	if err != nil {
-		return fmt.Errorf("getting feed by url: %w", err)
-	}
-
-	follow, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
-		ID:        uuid.New(),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-		UserID:    user.ID,
-		FeedID:    feed.ID,
-	})
-	if err != nil {
-		return fmt.Errorf("creating feed follow: %w", err)
-	}
-
-	fmt.Printf("%s is now following %s\n", follow.UserName, follow.FeedName)
-	return nil
-}
-
-func handlerUnfollow(s *state, cmd command, user database.User) error {
-	if len(cmd.args) != 1 {
-		return errors.New("unfollow requires a url argument")
-	}
-
-	url := cmd.args[0]
-
-	feed, err := s.db.GetFeedByURL(context.Background(), url)
-	if err != nil {
-		return fmt.Errorf("getting feed by url: %w", err)
-	}
-
-	err = s.db.DeleteFeedFollow(context.Background(), database.DeleteFeedFollowParams{
-		UserID: user.ID,
-		FeedID: feed.ID,
-	})
-	if err != nil {
-		return fmt.Errorf("deleting feed follow: %w", err)
-	}
-
-	fmt.Printf("%s has unfollowed %s\n", user.Name, feed.Name)
-	return nil
-}
-
-func handlerFollowing(s *state, cmd command, user database.User) error {
-	if len(cmd.args) != 0 {
-		return errors.New("following takes no arguments")
-	}
-
-	follows, err := s.db.GetFeedFollowsForUser(context.Background(), user.ID)
-	if err != nil {
-		return fmt.Errorf("getting feed follows: %w", err)
-	}
-
-	for _, follow := range follows {
-		fmt.Println(follow.FeedName)
-	}
-
-	return nil
-}
-
-func handlerLogin(s *state, cmd command) error {
-	if len(cmd.args) == 0 {
-		return errors.New("login requires a username argument")
-	}
-
-	username := cmd.args[0]
-
-	_, err := s.db.GetUser(context.Background(), username)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: user does not exist")
-		os.Exit(1)
-	}
-
-	err = s.cfg.SetUser(username)
-	if err != nil {
-		return fmt.Errorf("error setting user: %w", err)
-	}
-
-	fmt.Printf("User set to: %s\n", username)
-	return nil
-}
-
-func handlerRegister(s *state, cmd command) error {
-	if len(cmd.args) == 0 {
-		return errors.New("register requires a username argument")
-	}
-
-	username := cmd.args[0]
-
-	user, err := s.db.CreateUser(context.Background(), database.CreateUserParams{
-		ID:        uuid.New(),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-		Name:      username,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: user already exists or could not be created")
-		os.Exit(1)
-	}
-
-	err = s.cfg.SetUser(username)
-	if err != nil {
-		return fmt.Errorf("error setting user in config: %w", err)
-	}
-	fmt.Printf("User created successfully: %s\n", username)
-	log.Printf("Debug - User data: %+v\n", user)
-	return nil
-}
-
-func handlerReset(s *state, cmd command) error {
-	err := s.db.DeleteUsers(context.Background())
-	if err != nil {
-		return fmt.Errorf("error resetting users table: %w", err)
-	}
-	fmt.Println("Users table reset successfully")
-	return nil
-}
-
-func handlerUsers(s *state, cmd command) error {
-	users, err := s.db.GetUsers(context.Background())
-	if err != nil {
-		return fmt.Errorf("error getting users: %w", err)
-	}
-
-	currentUser := s.cfg.CurrentUserName
-	for _, user := range users {
-		if user.Name == currentUser {
-			fmt.Printf("* %s (current)\n", user.Name)
-			continue
-		}
-		fmt.Printf("* %s\n", user.Name)
-	}
-	return nil
-}
-
-func middlewareLoggedIn(
-	handler func(*state, command, database.User) error,
-) func(*state, command) error {
+func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error {
 	return func(s *state, cmd command) error {
 		user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
 		if err != nil {
@@ -254,257 +72,5 @@ func middlewareLoggedIn(
 		}
 
 		return handler(s, cmd, user)
-	}
-}
-
-func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-
-	req.Header.Set("User-Agent", "gator")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetching feed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
-	}
-
-	var feed RSSFeed
-	if err := xml.Unmarshal(body, &feed); err != nil {
-		return nil, fmt.Errorf("unmarshalling xml: %w", err)
-	}
-
-	feed.Channel.Title = html.UnescapeString(feed.Channel.Title)
-	feed.Channel.Description = html.UnescapeString(feed.Channel.Description)
-
-	for i := range feed.Channel.Item {
-		feed.Channel.Item[i].Title = html.UnescapeString(feed.Channel.Item[i].Title)
-		feed.Channel.Item[i].Description = html.UnescapeString(feed.Channel.Item[i].Description)
-	}
-
-	return &feed, nil
-}
-
-func parsePublishedAt(value string) (sql.NullTime, error) {
-	if value == "" {
-		return sql.NullTime{Valid: false}, nil
-	}
-	formats := []string{
-		time.RFC1123Z,
-		time.RFC1123,
-		time.RFC3339,
-		time.RFC822,
-		time.RFC822Z,
-	}
-	for _, format := range formats {
-		t, err := time.Parse(format, value)
-		if err == nil {
-			return sql.NullTime{
-				Time:  t,
-				Valid: true,
-			}, nil
-		}
-	}
-
-	return sql.NullTime{}, fmt.Errorf("unknown time format: %s", value)
-}
-
-func handlerBrowse(s *state, cmd command, user database.User) error {
-	limit := int32(2)
-
-	if len(cmd.args) > 1 {
-		return errors.New("browse accepts at most one optional limit argument")
-	}
-
-	if len(cmd.args) == 1 {
-		n, err := strconv.Atoi(cmd.args[0])
-		if err != nil {
-			return fmt.Errorf("invalid limit: %w", err)
-		}
-		limit = int32(n)
-	}
-
-	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
-		UserID: user.ID,
-		Limit:  limit,
-	})
-	if err != nil {
-		return fmt.Errorf("getting posts for user: %w", err)
-	}
-
-	for _, post := range posts {
-		fmt.Printf("Title: %s\n", post.Title)
-		fmt.Printf("URL: %s\n", post.Url)
-		if post.Description.Valid {
-			fmt.Printf("Description: %s\n", post.Description.String)
-		}
-		if post.PublishedAt.Valid {
-			fmt.Printf("Published At: %s\n", post.PublishedAt.Time.Format(time.RFC3339))
-		}
-		fmt.Println("---")
-	}
-	return nil
-}
-
-func scrapeFeeds(s *state) error {
-	feed, err := s.db.GetNextFeedToFetch(context.Background())
-	if err != nil {
-		return fmt.Errorf("getting next feed to fetch: %w", err)
-	}
-
-	if err := s.db.MarkFeedFetched(context.Background(), feed.ID); err != nil {
-		return fmt.Errorf("marking feed fetched: %w", err)
-	}
-
-	rssFeed, err := fetchFeed(context.Background(), feed.Url)
-	if err != nil {
-		return fmt.Errorf("fetching feed: %w", err)
-	}
-
-	for _, item := range rssFeed.Channel.Item {
-		publishedAt, err := parsePublishedAt(item.PubDate)
-		if err != nil {
-			log.Printf("could not parse published dat %q: %v", item.PubDate, err)
-		}
-
-		_, err = s.db.CreatePost(context.Background(), database.CreatePostParams{
-			ID:          uuid.New(),
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
-			Title:       item.Title,
-			Url:         item.Link,
-			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
-			PublishedAt: publishedAt,
-			FeedID:      feed.ID,
-		})
-
-		if err != nil {
-			if isDuplicatePostError(err) {
-				continue
-			}
-			log.Printf("creating post for %s: %v", item.Link, err)
-		}
-	}
-	return nil
-}
-
-func handlerAgg(s *state, cmd command) error {
-	if len(cmd.args) != 1 {
-		return errors.New("agg requires a time_between_reqs argument")
-	}
-
-	timeBetweenRequests, err := time.ParseDuration(cmd.args[0])
-	if err != nil {
-		return fmt.Errorf("parsing duration: %w", err)
-	}
-
-	fmt.Printf("Collecting feeds ever %s\n", timeBetweenRequests)
-	ticker := time.NewTicker(timeBetweenRequests)
-	defer ticker.Stop()
-
-	for ; ; <-ticker.C {
-		if err := scrapeFeeds(s); err != nil {
-			fmt.Fprintf(os.Stderr, "error scraping feeds: %v\n", err)
-		}
-	}
-}
-
-func handlerAddFeed(s *state, cmd command, user database.User) error {
-	if len(cmd.args) < 2 {
-		return errors.New("addfeed requires a name and url")
-	}
-
-	name := cmd.args[0]
-	url := cmd.args[1]
-
-	feed, err := s.db.CreateFeed(context.Background(), database.CreateFeedParams{
-		ID:        uuid.New(),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-		Name:      name,
-		Url:       url,
-		UserID:    user.ID,
-	})
-	if err != nil {
-		return fmt.Errorf("creating feed: %w", err)
-	}
-
-	follow, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
-		ID:        uuid.New(),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-		UserID:    user.ID,
-		FeedID:    feed.ID,
-	})
-	if err != nil {
-		return fmt.Errorf("creating feed follow: %w", err)
-	}
-
-	fmt.Printf("Feed created: %s\n", feed.Name)
-	fmt.Printf("%s is now following %s\n", follow.UserName, follow.FeedName)
-	return nil
-}
-
-func main() {
-	cfg, err := config.Read()
-	if err != nil {
-		log.Fatalf("error reading config: %v", err)
-	}
-
-	db, err := sql.Open("postgres", cfg.DBUrl)
-	if err != nil {
-		log.Fatalf("error connecting to database: %v", err)
-	}
-
-	dbQueries := database.New(db)
-
-	s := &state{
-		db:  dbQueries,
-		cfg: &cfg,
-	}
-
-	cmds := commands{
-		handlers: make(map[string]func(*state, command) error),
-	}
-
-	cmds.register("login", handlerLogin)
-	cmds.register("register", handlerRegister)
-	cmds.register("reset", handlerReset)
-	cmds.register("users", handlerUsers)
-	cmds.register("agg", handlerAgg)
-	cmds.register("feeds", handlerFeeds)
-	cmds.register("addfeed", middlewareLoggedIn(handlerAddFeed))
-	cmds.register("follow", middlewareLoggedIn(handlerFollow))
-	cmds.register("following", middlewareLoggedIn(handlerFollowing))
-	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
-	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
-
-	args := os.Args
-	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "error: not enough arguments, a command is required")
-		os.Exit(1)
-	}
-
-	cmd := command{
-		name: args[1],
-		args: args[2:],
-	}
-
-	err = cmds.run(s, cmd)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
 	}
 }
