@@ -12,7 +12,8 @@ import (
 
 func handlerBrowse(s *state, cmd command, user database.User) error {
 	fs := flag.NewFlagSet("browse", flag.ContinueOnError)
-	limit := fs.Int("limit", 2, "number of posts to display")
+	limit := fs.Int("limit", 2, "number of posts per page")
+	page := fs.Int("page", 1, "page number (1-based)")
 	sortBy := fs.String("sort", "date", "sort field: date, title, feed")
 	order := fs.String("order", "desc", "sort order: asc, desc")
 	feedFilter := fs.String("feed", "", "filter by feed name (case-insensitive substring match)")
@@ -66,17 +67,39 @@ func handlerBrowse(s *state, cmd command, user database.User) error {
 		return less
 	})
 
-	if *limit > 0 && len(posts) > *limit {
-		posts = posts[:*limit]
+	if *page < 1 {
+		return fmt.Errorf("page must be 1 or greater")
+	}
+	if *limit < 1 {
+		return fmt.Errorf("limit must be 1 or greater")
 	}
 
-	fmt.Printf("Found %d posts for user %s:\n", len(posts), user.Name)
+	total := len(posts)
+	totalPages := (total + *limit - 1) / *limit
+	if totalPages == 0 {
+		totalPages = 1
+	}
+
+	offset := (*page - 1) * *limit
+	if offset >= total {
+		return fmt.Errorf("page %d out of range (total pages: %d)", *page, totalPages)
+	}
+	end := offset + *limit
+	if end > total {
+		end = total
+	}
+	posts = posts[offset:end]
+
+	fmt.Printf("Page %d of %d (%d total posts) for user %s:\n", *page, totalPages, total, user.Name)
 	for _, post := range posts {
 		fmt.Printf("%s from %s\n", post.PublishedAt.Time.Format("Mon Jan 2"), post.FeedName)
 		fmt.Printf("--- %s ---\n", post.Title)
 		fmt.Printf("    %v\n", post.Description.String)
 		fmt.Printf("Link: %s\n", post.Url)
 		fmt.Println("=====================================")
+	}
+	if *page < totalPages {
+		fmt.Printf("(use --page=%d to see the next page)\n", *page+1)
 	}
 
 	return nil
